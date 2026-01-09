@@ -8,4 +8,4 @@ class TimeMixer(nn.Module):
         self.fc = nn.Linear(lookback, len(horizons))
 
     def forward(self, x):
-        return self.fc(x.float())
+        return self.fc(x)

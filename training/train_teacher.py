@@ -1,4 +1,3 @@
-# training/train_teacher.py
 import torch
 import torch.nn as nn
 
@@ -15,7 +14,7 @@ def train_teacher(
     model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.L1Loss()  # MAE
+    loss_fn = nn.L1Loss()  # MAE on log-diff targets
 
     best_val = float("inf")
     best_state = None
@@ -24,7 +23,7 @@ def train_teacher(
     for epoch in range(epochs):
         # ---- train ----
         model.train()
-        for x, y in train_loader:
+        for x, y, _last_price in train_loader:   # ✅ changed
             x, y = x.to(device), y.to(device)
             pred = model(x)
             loss = loss_fn(pred, y)
@@ -37,11 +36,11 @@ def train_teacher(
         model.eval()
         val_losses = []
         with torch.no_grad():
-            for x, y in val_loader:
+            for x, y, _last_price in val_loader:  # ✅ changed
                 x, y = x.to(device), y.to(device)
                 val_losses.append(loss_fn(model(x), y).item())
 
-        val_loss = sum(val_losses) / len(val_losses)
+        val_loss = sum(val_losses) / max(1, len(val_losses))
 
         if val_loss < best_val:
             best_val = val_loss

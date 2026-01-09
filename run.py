@@ -1,4 +1,3 @@
-# run.py
 import os
 import numpy as np
 import pandas as pd
@@ -8,15 +7,21 @@ from torch.utils.data import DataLoader, Subset
 from training.dataset import TimeSeriesDataset
 from training.metrics import compute_metrics
 from training.train_teacher import train_teacher
+from training.reconstruct import reconstruct_price
 
 from models.teachers.dlinear import DLinear
-from models.students.mlp import MLP
+from models.teachers.timemixer import TimeMixer
+from models.teachers.patchtst import PatchTST
+from models.teachers.pattn import PAttn
 
-LOOKBACK = 36
+# ================= CONFIG =================
+LOOKBACK = 48
 HORIZONS = [1, 2, 3]
 BATCH_SIZE = 32
+EPOCHS = 40
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# =========================================
 
 def load_series(path):
     return pd.read_csv(path)["price"].values.astype(np.float32)
@@ -26,79 +31,81 @@ def split_indices(n, train_ratio=0.7, val_ratio=0.15):
     n_train = int(n * train_ratio)
     n_val = int(n * val_ratio)
     idx = list(range(n))
-    return idx[:n_train], idx[n_train:n_train + n_val], idx[n_train + n_val:]
+    return idx[:n_train], idx[n_train:n_train+n_val], idx[n_train+n_val:]
 
 
-def predict(model, loader):
+def predict_prices(model, loader):
     model.eval()
-    outputs = []
+    diff_preds, last_prices = [], []
+
     with torch.no_grad():
-        for x, _ in loader:
-            outputs.append(model(x.to(DEVICE)).cpu().numpy())
-    return np.vstack(outputs)
+        for x, _, last_price in loader:
+            x = x.to(DEVICE)
+            diff_preds.append(model(x).cpu().numpy())
+            last_prices.append(last_price.numpy())
+
+    diff_preds = np.vstack(diff_preds)
+    last_prices = np.concatenate(last_prices)
+
+    return reconstruct_price(last_prices, diff_preds)
 
 
-def run_dataset(name, series):
-    dataset = TimeSeriesDataset(series, LOOKBACK, HORIZONS)
-    tr, va, te = split_indices(len(dataset))
+def collect_true_prices(series, indices):
+    y = []
+    for idx in indices:
+        y.append([series[idx + LOOKBACK + h] for h in HORIZONS])
+    return np.array(y)
 
-    train_loader = DataLoader(Subset(dataset, tr), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(Subset(dataset, va), batch_size=BATCH_SIZE, shuffle=False)
-    test_loader  = DataLoader(Subset(dataset, te), batch_size=BATCH_SIZE, shuffle=False)
 
-    y_val  = np.vstack([y.numpy() for _, y in val_loader])
-    y_test = np.vstack([y.numpy() for _, y in test_loader])
+def train_and_eval(dataset_name, series):
+    ds = TimeSeriesDataset(series, LOOKBACK, HORIZONS)
+    tr, va, te = split_indices(len(ds))
+
+    train_loader = DataLoader(Subset(ds, tr), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader   = DataLoader(Subset(ds, va), batch_size=BATCH_SIZE, shuffle=False)
+    test_loader  = DataLoader(Subset(ds, te), batch_size=BATCH_SIZE, shuffle=False)
+
+    y_val  = collect_true_prices(series, va)
+    y_test = collect_true_prices(series, te)
+
+    teachers = {
+        "DLinear": DLinear,
+        "TimeMixer": TimeMixer,
+        "PatchTST": PatchTST,
+        "PAttn": PAttn,
+    }
 
     rows = []
 
-    # ---------- Train DLinear teacher ----------
-    teacher = DLinear(LOOKBACK, HORIZONS)
-    teacher = train_teacher(teacher, train_loader, val_loader)
+    for name, cls in teachers.items():
+        print(f"Training {name} on {dataset_name}")
 
-    pred_val  = predict(teacher, val_loader)
-    pred_test = predict(teacher, test_loader)
+        model = cls(LOOKBACK, HORIZONS)
+        model = train_teacher(
+            model,
+            train_loader,
+            val_loader,
+            epochs=EPOCHS,
+            lr=1e-3,
+            patience=6,
+            device=DEVICE,
+        )
 
-    rows.append({
-        "dataset": name,
-        "model_type": "teacher_dlinear_val",
-        **compute_metrics(y_val, pred_val)
-    })
-    rows.append({
-        "dataset": name,
-        "model_type": "teacher_dlinear_test",
-        **compute_metrics(y_test, pred_test)
-    })
+        pred_val  = predict_prices(model, val_loader)
+        pred_test = predict_prices(model, test_loader)
 
-    # ---------- Distill into MLP ----------
-    teacher_train_preds = predict(teacher, train_loader)
-
-    student = MLP(LOOKBACK, HORIZONS).to(DEVICE)
-    optimizer = torch.optim.Adam(student.parameters(), lr=1e-3)
-    loss_fn = torch.nn.L1Loss()
-
-    for epoch in range(20):
-        student.train()
-        offset = 0
-        for x, y in train_loader:
-            b = x.shape[0]
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            t = torch.tensor(teacher_train_preds[offset:offset + b], device=DEVICE)
-            offset += b
-
-            pred = student(x)
-            loss = loss_fn(pred, y) + 0.3 * loss_fn(pred, t)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-    student_test_preds = predict(student, test_loader)
-
-    rows.append({
-        "dataset": name,
-        "model_type": "student_mlp_test",
-        **compute_metrics(y_test, student_test_preds)
-    })
+        rows.append({
+            "dataset": dataset_name,
+            "model": name,
+            "split": "val",
+            **compute_metrics(y_val, pred_val)
+        })
+        rows.append({
+            "dataset": dataset_name,
+            "model": name,
+            "split": "test",
+            **compute_metrics(y_test, pred_test)
+        })
 
     return rows
 
@@ -107,13 +114,20 @@ def main():
     rice = load_series("data/Wfp_rice.csv")
     wheat = load_series("data/Wfp_wheat.csv")
 
-    results = []
-    results.extend(run_dataset("rice", rice))
-    results.extend(run_dataset("wheat", wheat))
+    rows = []
+    rows.extend(train_and_eval("rice", rice))
+    rows.extend(train_and_eval("wheat", wheat))
 
     os.makedirs("outputs", exist_ok=True)
-    pd.DataFrame(results).to_csv("outputs/results.csv", index=False)
-    print("Saved outputs/results.csv")
+    df = pd.DataFrame(rows)
+    df.to_csv("outputs/results.csv", index=False)
+
+    print("\n=== Test MAE ranking ===")
+    print(
+        df[df.split == "test"]
+        .sort_values("AvgMAE")[["dataset", "model", "AvgMAE"]]
+        .to_string(index=False)
+    )
 
 
 if __name__ == "__main__":
